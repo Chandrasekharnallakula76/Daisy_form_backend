@@ -1,0 +1,20 @@
+[Unit]
+Description=Daisy event inquiry API
+After=network.target
+
+[Service]
+Type=simple
+User=daisy-gci-event
+Group=daisy-gci-event
+WorkingDirectory=/opt/daisy-gci-event/backend
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/daisy-gci-event.env
+ExecStart=/usr/bin/node src/server.js
+Restart=on-failure
+RestartSec=5
+StateDirectory=daisy-gci-event
+StateDirectoryMode=0750
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

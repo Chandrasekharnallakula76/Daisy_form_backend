@@ -1,93 +1,80 @@
-const crypto = require("node:crypto");
-const fs = require("node:fs/promises");
-const path = require("node:path");
-const cors = require("cors");
 const dotenv = require("dotenv");
-const express = require("express");
-const helmet = require("helmet");
+const { createApp } = require("./app");
+const { openStorage } = require("./storage");
 
-dotenv.config();
-
-const app = express();
-const port = Number(process.env.PORT) || 4000;
-const dataFile = path.resolve(process.env.DATA_FILE || "./data/inquiries.json");
-let writeQueue = Promise.resolve();
-
-app.use(helmet());
-app.use(cors({ origin: process.env.CLIENT_ORIGIN || "*" }));
-app.use(express.json({ limit: "20kb" }));
-
-app.get("/api/health", (_request, response) => {
-  response.json({ status: "ok" });
-});
-
-app.post("/api/inquiries", async (request, response, next) => {
+async function startServer({ env = process.env, logger = console } = {}) {
+  const production = env.NODE_ENV === "production" || Boolean(env.K_SERVICE);
+  const port = env.PORT === undefined || env.PORT === "" ? 4000 : Number(env.PORT);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    throw new Error("PORT must be an integer between 0 and 65535");
+  }
+  const backend = env.STORAGE_BACKEND || (production ? "postgres" : "sqlite");
+  if (!["postgres", "sqlite"].includes(backend)) throw new Error("STORAGE_BACKEND must be postgres or sqlite");
+  if (production && backend === "sqlite") throw new Error("SQLite is unavailable in production; configure PostgreSQL");
+  const host = env.HOST || (production ? "0.0.0.0" : "127.0.0.1");
+  const proxySetting = env.TRUST_PROXY_HOPS;
+  const trustProxyHops = proxySetting === undefined || proxySetting === ""
+    ? (env.K_SERVICE ? 1 : undefined) : Number(proxySetting);
+  if (trustProxyHops !== undefined && (!Number.isInteger(trustProxyHops) || trustProxyHops < 1)) {
+    throw new Error("TRUST_PROXY_HOPS must be a positive integer");
+  }
+  const store = backend === "postgres"
+    ? await require("./postgres-storage").openPostgresStorage({ env, logger })
+    : await openStorage(env.DATABASE_PATH || "./data/inquiries.sqlite");
+  let app;
+  let server;
   try {
-    const inquiry = {
-      ...request.body,
-      id: crypto.randomUUID(),
-      submittedAt: new Date().toISOString(),
-    };
-
-    await saveInquiry(inquiry);
-    return response.status(201).json({ message: "Inquiry received", inquiry });
+    app = createApp({
+      store,
+      clientOrigin: env.CLIENT_ORIGIN,
+      nodeEnv: production ? "production" : env.NODE_ENV,
+      staticDir: env.STATIC_DIR,
+      appBasePath: env.APP_BASE_PATH,
+      trustProxyHops,
+      logger,
+    });
+    server = await new Promise((resolve, reject) => {
+      const listener = app.listen(port, host, () => resolve(listener));
+      listener.once("error", reject);
+    });
   } catch (error) {
-    return next(error);
+    try { await app?.locals.close(); }
+    finally { await store.close(); }
+    throw error;
   }
-});
-
-app.use((_request, response) => {
-  response.status(404).json({ error: "Not found" });
-});
-
-app.use((error, _request, response, _next) => {
-  if (error.type === "entity.parse.failed") {
-    return response
-      .status(400)
-      .json({ error: "Request body must be valid JSON" });
-  }
-  if (error.type === "entity.too.large") {
-    return response.status(413).json({ error: "Request body is too large" });
-  }
-
-  console.error(error);
-  return response.status(500).json({ error: "Unable to process inquiry" });
-});
-
-function saveInquiry(inquiry) {
-  const save = async () => {
-    await fs.mkdir(path.dirname(dataFile), { recursive: true });
-
-    let inquiries = [];
-    try {
-      inquiries = JSON.parse(await fs.readFile(dataFile, "utf8"));
-      if (!Array.isArray(inquiries)) {
-        throw new Error("Inquiry data file must contain a JSON array");
+  let closing;
+  const close = () => {
+    closing ??= (async () => {
+      try {
+        await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      } finally {
+        try { await app.locals.close(); }
+        finally { await store.close(); }
       }
-    } catch (error) {
-      if (error.code !== "ENOENT") {
-        throw error;
-      }
-    }
-
-    inquiries.push(inquiry);
-    const temporaryFile = `${dataFile}.${process.pid}.tmp`;
-    await fs.writeFile(temporaryFile, JSON.stringify(inquiries, null, 2));
-    await fs.rename(temporaryFile, dataFile);
+    })();
+    return closing;
   };
-
-  writeQueue = writeQueue.then(save, save);
-  return writeQueue;
+  logger.log(`Inquiry API listening on ${host}:${server.address().port}`);
+  return { app, server, store, close };
 }
 
-app.listen(port, (error) => {
-  if (error) {
-    console.error(
-      error.code === "EADDRINUSE"
-        ? `Port ${port} is already in use. Set a different PORT in .env.`
-        : error,
-    );
-    process.exit(1);
-  }
-  console.log(`Inquiry API listening on port ${port}`);
-});
+if (require.main === module) {
+  dotenv.config();
+  startServer().then(({ close }) => {
+    const shutdown = () => {
+      close().catch((error) => {
+        console.error(error.message);
+        process.exitCode = 1;
+      });
+    };
+    process.once("SIGTERM", shutdown);
+    process.once("SIGINT", shutdown);
+  }).catch((error) => {
+    console.error(error.code === "EADDRINUSE"
+      ? "The configured port is already in use. Set a different PORT in .env."
+      : error.message);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { startServer };

@@ -1,4 +1,12 @@
 node_modules/
 .env
-data/inquiries.json
+data/
+backups/
+*.sqlite
+*.sqlite3
+*.db
+*-wal
+*-shm
+*-journal
+.daisy-backup-*/
 npm-debug.log*
